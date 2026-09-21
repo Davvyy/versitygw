@@ -5,7 +5,7 @@
 
 ## 왜 자체 빌드인가
 
-versitygw `v1.8.0` 은 Elasticsearch 의 `_snapshot/.../\_analyze` 를 통과하지 못한다.
+versitygw `v1.8.0` 은 Elasticsearch 의 `_snapshot/<repo>/_analyze` 를 통과하지 못한다.
 결함은 **`abortWrite` 하나**로, ES 가 중단한 업로드를 게이트웨이가 **보이게 남기는** 것이다.
 
 ```
