@@ -50,9 +50,11 @@ git checkout -B build/v1.8.0-esweb v1.8.0
 git cherry-pick -x c3669662 d383e1f3 d03ac3c2
 
 # 🔴 VERSION 을 반드시 만든다 (.gitignore 대상이라 브랜치에 없다)
-printf 'v1.8.0+esweb.1\n' > VERSION
+printf 'v1.8.0+esweb.2\n' > VERSION
 
-docker run --rm -v "$PWD:/src" -w /src -e GOFLAGS=-buildvcs=false golang:1.26 \
+# 🔴 CGO_ENABLED=0 을 반드시 준다 - 아래 <릴리스와 같게 만드는 것> 참고
+docker run --rm -v "$PWD:/src" -w /src \
+  -e GOFLAGS=-buildvcs=false -e CGO_ENABLED=0 golang:1.26 \
   sh -c 'git config --global --add safe.directory /src && make build'
 ```
 
@@ -64,10 +66,47 @@ Makefile 은 `VERSION` 파일이 없으면 `git describe --abbrev=0 --tags` 로 
 
 ```
 $ ./versitygw --version
-Version  : v1.8.0+esweb.1     <- 이래야 한다
-Build    : 41a18167
-BuildTime: 2026-09-21_12:14:43AM
+Version  : v1.8.0+esweb.2     <- 이래야 한다
+Build    : 8d98aee6
+BuildTime: 2026-09-21_12:45:50AM
 ```
+
+### 🔴 `CGO_ENABLED=0` — 릴리스와 같게 만드는 유일한 조건
+
+**`make build` 만으로는 릴리스와 같은 바이너리가 안 나온다.** 릴리스는 Makefile 이
+아니라 `.goreleaser.yaml` 로 만들고, 거기에만 이 설정이 있다. 주석이 이유를 적어 두었다.
+
+```yaml
+env:
+  # disable cgo to fix glibc issues: https://github.com/golang/go/issues/58550
+  - CGO_ENABLED=0
+```
+
+golang 이미지에는 gcc 가 있어 **기본값이 `CGO_ENABLED=1`** 이다. 그대로 빌드하면
+**glibc 에 동적 링크된** 바이너리가 나온다.
+
+| | 릴리스 `v1.8.0` | CGO 켠 빌드 | **CGO 끈 빌드** |
+|---|---|---|---|
+| 크기 | 57.2 MiB | 79.7 MiB | **58.1 MiB** |
+| 동적 로더 참조 | 없음 | 🔴 있음 | **없음** |
+| `GLIBC_` 버전 문자열 | 0 | 🔴 **63** | **0** |
+
+🔴 **드러나는 시점이 나쁘다.** 컨테이너 안에서는 잘 돌고 단위 테스트도 다 통과하고,
+반입해서 운영 노드에서 **처음 실행할 때** 터진다 — 그것도 우리 패치 탓처럼 보인다.
+
+```
+./versitygw: /lib64/libc.so.6: version `GLIBC_2.38' not found
+```
+
+빌드 노드(Debian 계열)의 glibc 가 운영 노드(RHEL 계열)보다 높으면 그렇게 된다.
+
+✅ **덤으로 테스트도 좋아진다.** CGO 를 켜면 `s3api` 와 `rdma/rcroutes` 가
+`ld: cannot find -l:librcserver.a` 로 링크에 실패하는데(RDMA 용 정적 라이브러리는 별도
+빌더 이미지로 만든다), 끄면 `s3api` 는 정상 통과하고 rdma 쪽은 아예 대상에서 빠진다 —
+cgo 경로라 맞는 동작이다.
+
+⚠ **이 문서의 첫 판(`+esweb.1`)이 정확히 이것을 밟았다.** "상류 Makefile 을 그대로
+쓰니 릴리스와 같은 방식" 이라고 적었는데 틀렸다. 그 산출물은 폐기했다.
 
 ### ⚠ 사내망에서 `go mod download` 가 x509 로 막힌다
 
@@ -80,11 +119,11 @@ docker run ... -v "$PWD/ca:/ca:ro" ... \
   sh -c 'cp /ca/somansa-root.crt /usr/local/share/ca-certificates/ && update-ca-certificates && make build'
 ```
 
-## 검증 (2026-09-21 · `golang:1.26` / go1.26.8 linux/amd64)
+## 검증 (2026-09-21 · `golang:1.26` / go1.26.8 linux/amd64 / `CGO_ENABLED=0`)
 
 ```
-sha256  20d3eb12fa2fac7e062c03b25be60fe44d5ff4c661bceca2f4aeb7cfeba04602
-크기    83,545,440 B
+sha256  4b62c5fade3fca6afb3a0725a3b9b93b79ab791914baabfe32b9888c98231956
+크기    60,916,254 B  (58.1 MiB)
 ```
 
 - **패치 핵심 테스트 전부 PASS** — `TestContentLengthReader`(truncated_body · EOF with
@@ -92,13 +131,12 @@ sha256  20d3eb12fa2fac7e062c03b25be60fe44d5ff4c661bceca2f4aeb7cfeba04602
   Content-Length) · `TestContentLengthReaderPassesThroughOtherErrors` ·
   `TestUnsignedChunkReaderContentLengthMismatchStopsAtDecodedLength` ·
   `TestDrainRequestBody_*` 8건
-- **`go test ./...` 테스트 실패 0건** (16개 패키지 `ok`)
-- ⚠ **빌드 실패 2건은 환경 문제다** — `s3api` · `rdma/rcroutes` 가
-  `ld: cannot find -l:librcserver.a` 로 링크에 실패한다. RDMA 용 정적 라이브러리는
-  별도 빌더 이미지(`build/vgwrdma-builder/`)로 만드는 것이라 평범한 golang 컨테이너에
-  없다. **손대지 않은 `v1.8.0` 에서 똑같이 재현되는 것을 확인했다**(대조군). 우리가
-  쓰는 posix 백엔드와 무관하고, 실제 산출물 `cmd/versitygw` 는 정상 빌드되며 그 패키지
-  테스트도 `ok` 다.
+- `TestUnsignedChunkReader*` 6건
+- **`go test ./...` — 29개 패키지 `ok`, 테스트 실패 0건, 빌드 실패 0건**
+
+> 참고로 **CGO 를 켜고 돌렸을 때는** `s3api` 와 `rdma/rcroutes` 가
+> `ld: cannot find -l:librcserver.a` 로 링크에 실패했다. 손대지 않은 `v1.8.0` 에서도
+> 똑같이 재현되는 환경 문제였고, `CGO_ENABLED=0` 으로 바꾸면서 사라졌다.
 
 ### 🔴 단위 테스트 통과는 **소스**를 검증한 것이다
 
